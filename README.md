@@ -1,9 +1,11 @@
+> **Проверка безопасности бинарной сборки.** Microsoft Defender обнаруживает в `v1.2.1` угрозу `Trojan:Win32/Wacatac.B!ml`. Релиз временно снят с публичной выдачи. Ложное срабатывание пока не подтверждено. Не отключайте защиту и не добавляйте EXE в исключения. Старые релизы не считаются проверенной заменой. Статус: [SECURITY.md](SECURITY.md).
+
 <p align="center">
   <img src="docs/images/overview.svg" alt="TakeoutDateRepair — восстановление дат фото и видео из Google Takeout" width="100%">
 </p>
 
 <p align="center">
-  <a href="https://github.com/yargl5/TakeoutDateRepair/releases/latest"><img alt="Скачать для Windows" src="https://img.shields.io/badge/Скачать-Windows_x64-2563eb?style=for-the-badge&logo=windows&logoColor=white"></a>
+  <a href="SECURITY.md"><img alt="Бинарная сборка проверяется" src="https://img.shields.io/badge/Бинарная_сборка-проверка_безопасности-b45309?style=for-the-badge"></a>
   <img alt="Работает локально" src="https://img.shields.io/badge/Без_облака-локальная_обработка-15803d?style=for-the-badge">
   <a href="LICENSE"><img alt="Лицензия MIT" src="https://img.shields.io/badge/Код-MIT-475569?style=for-the-badge"></a>
 </p>
@@ -33,7 +35,7 @@ Google Takeout сохраняет фотографии и видео вмест�
 
 ## Скачать и запустить
 
-**[Открыть последний релиз →](https://github.com/yargl5/TakeoutDateRepair/releases/latest)**
+**Распространение текущей бинарной сборки приостановлено.** Предыдущие релизы могут оставаться в истории GitHub; они не рекомендованы в качестве обхода обнаружения. Перед скачиванием и запуском проверьте статус в [SECURITY.md](SECURITY.md).
 
 Скачайте `TakeoutDateRepair.exe` или ZIP с приложением и лицензиями. Установка Python, .NET SDK и отдельного ExifTool не нужна.
 

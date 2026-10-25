@@ -17,7 +17,7 @@ try {
 } finally { $resource.Dispose() }
 Expand-Archive -LiteralPath $archive -DestinationPath $extract
 $tool = Join-Path $extract 'ExifTool.exe'
-foreach ($test in @('ValidationTests','CleanupTests','AdditionalTests')) {
+foreach ($test in @('ValidationTests','CleanupTests','AdditionalTests','MultiFolderTests')) {
     $testExe = Join-Path $runRoot ($test + '.exe')
     & $compiler /nologo /target:exe /codepage:65001 "/reference:$exe" /reference:System.Drawing.dll /reference:System.Web.Extensions.dll "/out:$testExe" (Join-Path $repoRoot ('tests\' + $test + '.cs'))
     if ($LASTEXITCODE -ne 0) { throw "Compilation failed: $test" }

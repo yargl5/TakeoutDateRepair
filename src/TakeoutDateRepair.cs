@@ -14,6 +14,10 @@ using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
+[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyProduct("TakeoutDateRepair")]
+
 namespace TakeoutDateRepair
 {
     public sealed class Sidecar
@@ -32,8 +36,14 @@ namespace TakeoutDateRepair
     {
         public List<Item> Items = new List<Item>();
         public List<string> Issues = new List<string>();
-        public int JsonCount, OrphanCount;
+        public int JsonCount, OrphanCount, DirectoryCount;
+        public List<FolderSummary> Folders = new List<FolderSummary>();
         public string Root;
+    }
+    public sealed class FolderSummary
+    {
+        public string Path;
+        public int MediaCount, ReadyCount, ProblemCount;
     }
     public sealed class History
     {
@@ -52,23 +62,35 @@ namespace TakeoutDateRepair
         static readonly HashSet<string> QuickTime = new HashSet<string>(new[] { ".mp4", ".mov", ".m4v", ".3gp", ".3g2" }, StringComparer.OrdinalIgnoreCase);
         static readonly HashSet<string> Exif = new HashSet<string>(new[] { ".jpg", ".jpeg", ".jpe", ".tif", ".tiff", ".heic", ".heif", ".png", ".webp", ".avif", ".dng" }, StringComparer.OrdinalIgnoreCase);
         public static JavaScriptSerializer Serializer() { return new JavaScriptSerializer { MaxJsonLength = 16 * 1024 * 1024 }; }
-        public static string Full(string path) { return System.IO.Path.GetFullPath(path).TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar); }
-        public static bool Within(string child, string parent) { return string.Equals(Full(child), Full(parent), StringComparison.OrdinalIgnoreCase) || Full(child).StartsWith(Full(parent) + System.IO.Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase); }
-        static void Check(CancellationToken token) { token.ThrowIfCancellationRequested(); }
-        static List<string> Files(string root, List<string> issues, CancellationToken token)
+        public static string Full(string path)
         {
-            var files = new List<string>(); var pending = new Stack<string>(); pending.Push(root);
+            string full = System.IO.Path.GetFullPath(path), root = System.IO.Path.GetPathRoot(full);
+            return string.Equals(full, root, StringComparison.OrdinalIgnoreCase) ? full : full.TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar);
+        }
+        public static bool Within(string child, string parent)
+        {
+            string fullChild = Full(child), fullParent = Full(parent);
+            string prefix = fullParent.EndsWith(System.IO.Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal) ? fullParent : fullParent + System.IO.Path.DirectorySeparatorChar;
+            return string.Equals(fullChild, fullParent, StringComparison.OrdinalIgnoreCase) || fullChild.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+        }
+        static void Check(CancellationToken token) { token.ThrowIfCancellationRequested(); }
+        static List<string> Files(Scan scan, CancellationToken token, Action<string> progress)
+        {
+            var files = new List<string>(); var pending = new Stack<string>(); pending.Push(scan.Root);
             while (pending.Count > 0)
             {
                 Check(token); string dir = pending.Pop();
+                scan.DirectoryCount++;
+                if (scan.DirectoryCount == 1 || scan.DirectoryCount % 25 == 0)
+                    progress("Поиск во всех подпапках. Просмотрено папок: " + scan.DirectoryCount + " — " + dir);
                 try
                 {
                     files.AddRange(Directory.GetFiles(dir));
                     foreach (string sub in Directory.GetDirectories(dir))
                         if ((File.GetAttributes(sub) & FileAttributes.ReparsePoint) == 0) pending.Push(sub);
-                        else issues.Add("Пропущена ссылка на папку: " + sub);
+                        else scan.Issues.Add("Пропущена ссылка на папку: " + sub);
                 }
-                catch (Exception ex) { issues.Add("Не прочитана папка: " + dir + " — " + ex.Message); }
+                catch (Exception ex) { scan.Issues.Add("Не прочитана папка: " + dir + " — " + ex.Message); }
             }
             return files;
         }
@@ -127,7 +149,7 @@ namespace TakeoutDateRepair
         public static Scan Analyze(string root, bool fallback, CancellationToken token, Action<string> progress)
         {
             var scan = new Scan { Root = Full(root) };
-            var files = Files(root, scan.Issues, token);
+            var files = Files(scan, token, progress);
             var byName = new Dictionary<string, List<Sidecar>>(StringComparer.OrdinalIgnoreCase);
             var byTitle = new Dictionary<string, List<Sidecar>>(StringComparer.OrdinalIgnoreCase);
             var global = new Dictionary<string, List<Sidecar>>(StringComparer.OrdinalIgnoreCase);
@@ -166,7 +188,14 @@ namespace TakeoutDateRepair
             }
             foreach (var sc in sidecars.Where(x => !used.Contains(x.Path)))
             { scan.OrphanCount++; scan.Issues.Add("JSON без однозначно найденного медиа: " + sc.Path + (sc.Error == null ? "" : " — " + sc.Error)); }
+            foreach (var group in scan.Items.GroupBy(x => System.IO.Path.GetDirectoryName(x.Source), StringComparer.OrdinalIgnoreCase).OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase))
+                scan.Folders.Add(new FolderSummary { Path = group.Key, MediaCount = group.Count(), ReadyCount = group.Count(x => x.Problem == null), ProblemCount = group.Count(x => x.Problem != null) });
             progress("Анализ завершён"); return scan;
+        }
+        public static string Relative(string path, string root)
+        {
+            if (string.Equals(Full(path), Full(root), StringComparison.OrdinalIgnoreCase)) return "(корневая папка)";
+            return Within(path, root) ? Full(path).Substring(Full(root).Length).TrimStart(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar) : path;
         }
         public static string Hash(string path, CancellationToken token)
         {
@@ -248,6 +277,8 @@ namespace TakeoutDateRepair
             using (var w = new StreamWriter(file, false, new UTF8Encoding(true)))
             {
                 Row(w, "Статус", "Исходный файл", "JSON", "Дата UTC", "Примечание");
+                Row(w, "Сводка анализа", scan.Root, "", "", "Просмотрено папок: " + scan.DirectoryCount + "; папок с медиа: " + scan.Folders.Count);
+                foreach (var summary in scan.Folders) Row(w, "Папка", summary.Path, "", "", "Медиа: " + summary.MediaCount + "; готовы: " + summary.ReadyCount + "; проблемы: " + summary.ProblemCount);
                 foreach (var item in scan.Items) Row(w, item.Problem == null ? "Готов" : "Проблема", item.Source, item.Metadata == null ? "" : item.Metadata.Path,
                     item.Metadata == null || item.Metadata.Error != null ? "" : item.Metadata.Utc.ToString("o"), item.Problem ?? item.Note);
                 foreach (string issue in scan.Issues) Row(w, "Проблема анализа", "", "", "", issue);
@@ -308,7 +339,7 @@ namespace TakeoutDateRepair
                             if (!File.Exists(item.Metadata.Path) || Hash(item.Metadata.Path, token) != item.Metadata.ContentHash)
                                 throw new IOException("JSON изменился или исчез после анализа. Повторите анализ; исходник сохранён");
                             var utc = item.Metadata.Utc; string stamp = utc.ToString("o");
-                            progress(stats, "Обработка: " + System.IO.Path.GetFileName(item.Source), false);
+                            progress(stats, "Обработка: " + Relative(item.Source, scan.Root), false);
                             string sourceHash = Hash(item.Source, token); string key = sourceHash + "|" + stamp;
                             History existing = null; List<History> candidates;
                             if (dedupe && history.TryGetValue(key, out candidates))
@@ -375,7 +406,7 @@ namespace TakeoutDateRepair
                         stats.Done++;
                         Row(report, status, item.Source, target, item.Metadata == null ? "" : item.Metadata.Path,
                             item.Metadata == null || item.Metadata.Error != null ? "" : item.Metadata.Utc.ToString("o"), note);
-                        progress(stats, status + ": " + System.IO.Path.GetFileName(item.Source) + (note.Length > 0 ? " — " + note : ""), bad || warning);
+                        progress(stats, status + ": " + Relative(item.Source, scan.Root) + (note.Length > 0 ? " — " + note : ""), bad || warning);
                         if (token.IsCancellationRequested) break;
                     }
                     Row(report, token.IsCancellationRequested ? "Обработка остановлена" : "Обработка завершена", "", "", "", "",
@@ -392,12 +423,12 @@ namespace TakeoutDateRepair
         readonly CheckBox move = new CheckBox(), cleanup = new CheckBox(), dedupe = new CheckBox(), fallback = new CheckBox();
         readonly Label state = new Label(), counts = new Label();
         readonly ProgressBar bar = new ProgressBar();
-        readonly ListView messages = new ListView();
+        readonly ListView messages = new ListView(), folders = new ListView();
         CancellationTokenSource cancellation;
         Scan scan; string reportPath; bool busy; readonly string exe;
         public MainForm(string tool)
         {
-            exe = tool; Text = "Takeout — восстановление дат фото и видео"; MinimumSize = new Size(860, 690); Size = new Size(1040, 820);
+            exe = tool; Text = "TakeoutDateRepair 1.1.0 — все вложенные папки"; MinimumSize = new Size(860, 690); Size = new Size(1040, 820);
             StartPosition = FormStartPosition.CenterScreen; Font = new Font("Segoe UI", 10); BackColor = Color.FromArgb(245, 247, 250);
             var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(22), ColumnCount = 3, RowCount = 13 };
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 132)); layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
@@ -407,11 +438,11 @@ namespace TakeoutDateRepair
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 27)); layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34)); layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             var title = new Label { Text = "Вернуть фотографиям их даты", Font = new Font("Segoe UI", 19, FontStyle.Bold), Dock = DockStyle.Fill };
             layout.Controls.Add(title, 0, 0); layout.SetColumnSpan(title, 3);
-            layout.Controls.Add(new Label { Text = "Папка Takeout", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 1);
+            layout.Controls.Add(new Label { Text = "Общая папка", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 1);
             source.Dock = DockStyle.Fill; layout.Controls.Add(source, 1, 1); pickSource.Text = "Выбрать…"; pickSource.Dock = DockStyle.Fill; layout.Controls.Add(pickSource, 2, 1);
             layout.Controls.Add(new Label { Text = "Результат", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 2);
             destination.Dock = DockStyle.Fill; layout.Controls.Add(destination, 1, 2); pickDestination.Text = "Выбрать…"; pickDestination.Dock = DockStyle.Fill; layout.Controls.Add(pickDestination, 2, 2);
-            var hint = new Label { Text = "Одна папка • исходные имена • даты съёмки UTC\nОдиночные файлы, JSON без пары и исходники с ошибками сохраняются для следующей распаковки.", Dock = DockStyle.Fill, ForeColor = Color.FromArgb(70, 80, 95) };
+            var hint = new Label { Text = "Все вложенные папки включены • результат в одну папку • даты UTC\nВыберите общую папку Google Фото или Takeout — папки по годам будут найдены автоматически.", Dock = DockStyle.Fill, ForeColor = Color.FromArgb(70, 80, 95) };
             layout.Controls.Add(hint, 0, 3); layout.SetColumnSpan(hint, 3);
             move.Text = "Перемещать: удалять исходник только после проверки результата"; move.Checked = true; move.AutoSize = true;
             cleanup.Text = "Удалять JSON обработанной пары; общий JSON — после обработки всех связанных файлов"; cleanup.Checked = true; cleanup.AutoSize = true;
@@ -423,13 +454,19 @@ namespace TakeoutDateRepair
             foreach (var b in new[] { analyze, start, cancel, report }) { b.AutoSize = true; b.Height = 36; b.Padding = new Padding(8, 2, 8, 2); buttons.Controls.Add(b); }
             start.BackColor = Color.FromArgb(35, 100, 190); start.ForeColor = Color.White; start.FlatStyle = FlatStyle.Flat;
             layout.Controls.Add(buttons, 0, 8); layout.SetColumnSpan(buttons, 3);
-            state.Text = "Выберите папки. Анализ не изменяет фотографии и видео."; state.Dock = DockStyle.Fill;
+            state.Text = "Выберите общую папку. Все подпапки обрабатываются за один запуск."; state.Dock = DockStyle.Fill;
             layout.Controls.Add(state, 0, 9); layout.SetColumnSpan(state, 3);
             bar.Dock = DockStyle.Fill; layout.Controls.Add(bar, 0, 10); layout.SetColumnSpan(bar, 3);
             counts.Text = "Выполнено: 0 / 0"; counts.Dock = DockStyle.Fill; layout.Controls.Add(counts, 0, 11); layout.SetColumnSpan(counts, 3);
             messages.Dock = DockStyle.Fill; messages.View = View.Details; messages.FullRowSelect = true; messages.GridLines = true;
             messages.Columns.Add("Статус", 120); messages.Columns.Add("Файл / описание проблемы", 780);
-            layout.Controls.Add(messages, 0, 12); layout.SetColumnSpan(messages, 3); Controls.Add(layout);
+            folders.Dock = DockStyle.Fill; folders.View = View.Details; folders.FullRowSelect = true; folders.GridLines = true;
+            folders.Columns.Add("Папка внутри выбранной", 580); folders.Columns.Add("Медиа", 100); folders.Columns.Add("Готовы", 100); folders.Columns.Add("Проблемы", 110);
+            var tabs = new TabControl { Dock = DockStyle.Fill };
+            var fileTab = new TabPage("Файлы и проблемы"); fileTab.Controls.Add(messages);
+            var folderTab = new TabPage("Все найденные папки"); folderTab.Controls.Add(folders);
+            tabs.TabPages.Add(fileTab); tabs.TabPages.Add(folderTab);
+            layout.Controls.Add(tabs, 0, 12); layout.SetColumnSpan(tabs, 3); Controls.Add(layout);
             pickSource.Click += delegate { Pick(source); }; pickDestination.Click += delegate { Pick(destination); };
             source.TextChanged += delegate { InvalidateScan(); }; fallback.CheckedChanged += delegate { InvalidateScan(); };
             move.CheckedChanged += delegate { EnableControls(); };
@@ -439,10 +476,10 @@ namespace TakeoutDateRepair
             FormClosing += delegate(object sender, FormClosingEventArgs e) { if (busy) { e.Cancel = true; cancellation.Cancel(); state.Text = "Дождитесь безопасной остановки, затем закройте окно."; } };
             EnableControls();
         }
-        void Pick(TextBox box) { using (var d = new FolderBrowserDialog { Description = box == source ? "Выберите папку Google Фото" : "Выберите отдельную папку для результата", ShowNewFolderButton = true }) { if (Directory.Exists(box.Text)) d.SelectedPath = box.Text; if (d.ShowDialog(this) == DialogResult.OK) box.Text = d.SelectedPath; } }
+        void Pick(TextBox box) { using (var d = new FolderBrowserDialog { Description = box == source ? "Выберите общую папку Google Фото или Takeout. Все вложенные папки по годам будут включены автоматически." : "Выберите отдельную папку для результата всех годов", ShowNewFolderButton = true }) { if (Directory.Exists(box.Text)) d.SelectedPath = box.Text; if (d.ShowDialog(this) == DialogResult.OK) box.Text = d.SelectedPath; } }
         void InvalidateScan()
         {
-            scan = null; reportPath = null; messages.Items.Clear(); bar.Value = 0;
+            scan = null; reportPath = null; messages.Items.Clear(); folders.Items.Clear(); bar.Value = 0;
             counts.Text = "Выполнено: 0 / 0";
             state.Text = "Папка или настройки изменены. Нажмите «1. Анализ».";
             EnableControls();
@@ -463,13 +500,18 @@ namespace TakeoutDateRepair
         {
             if (!Directory.Exists(source.Text)) { MessageBox.Show(this, "Выберите существующую папку с экспортом Google Фото."); return; }
             string root = source.Text; bool useFallback = fallback.Checked;
-            busy = true; cancellation = new CancellationTokenSource(); scan = null; EnableControls(); messages.Items.Clear(); bar.Style = ProgressBarStyle.Marquee; state.Text = "Поиск фото, видео и JSON во вложенных папках…";
+            busy = true; cancellation = new CancellationTokenSource(); scan = null; EnableControls(); messages.Items.Clear(); folders.Items.Clear(); bar.Style = ProgressBarStyle.Marquee; state.Text = "Поиск фото, видео и JSON во всех вложенных папках…";
             try
             {
                 scan = await Task.Run(() => Engine.Analyze(root, useFallback, cancellation.Token, s => Ui(() => state.Text = s)));
                 int problems = scan.Items.Count(x => x.Problem != null);
-                state.Text = "Найдено медиа: " + scan.Items.Count.ToString("N0") + "; готовы: " + (scan.Items.Count - problems).ToString("N0") + "; проблем: " + problems + "; JSON без пары: " + scan.OrphanCount;
-                counts.Text = "Медиа: " + scan.Items.Count + " | JSON: " + scan.JsonCount + " | Замечаний анализа: " + scan.Issues.Count;
+                state.Text = "Папок с медиа: " + scan.Folders.Count + "; медиа: " + scan.Items.Count.ToString("N0") + "; готовы: " + (scan.Items.Count - problems).ToString("N0") + "; проблем: " + problems + "; JSON без пары: " + scan.OrphanCount;
+                counts.Text = "Просмотрено папок: " + scan.DirectoryCount + " | С медиа: " + scan.Folders.Count + " | Медиа: " + scan.Items.Count + " | JSON: " + scan.JsonCount;
+                foreach (var folder in scan.Folders)
+                {
+                    var row = new ListViewItem(Engine.Relative(folder.Path, scan.Root)); row.SubItems.Add(folder.MediaCount.ToString()); row.SubItems.Add(folder.ReadyCount.ToString()); row.SubItems.Add(folder.ProblemCount.ToString()); folders.Items.Add(row);
+                }
+                Message("Все " + scan.Folders.Count + " папок с медиа включены в общую очередь. Список — во вкладке «Все найденные папки».", false);
                 foreach (var i in scan.Items.Where(x => x.Problem != null || x.Note != null).Take(1000)) Message(i.Source + " — " + (i.Problem ?? i.Note), true);
                 foreach (var issue in scan.Issues.Take(300)) Message(issue, true);
                 string reports = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "TakeoutDateRepair-reports"); reportPath = Engine.SaveScan(scan, reports);
@@ -491,7 +533,7 @@ namespace TakeoutDateRepair
             }
             catch (Exception ex) { MessageBox.Show(this, ex.Message); return; }
             bool moving = move.Checked, skipDuplicates = dedupe.Checked, deleteJson = cleanup.Checked;
-            if (moving && MessageBox.Show(this, "После проверки результата будут удалены исходные фото и видео, включая дубликаты с проверенной готовой копией.\n\n" + (deleteJson ? "JSON обработанных пар также удалятся. Общий JSON удалится, только когда больше не нужен оставшимся исходникам." : "Исходные JSON останутся на месте.") + "\n\nФайлы без пары и файлы с ошибками сохранятся.\n\nПродолжить перемещение в:\n" + dest + "?", "Подтверждение перемещения", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            if (moving && MessageBox.Show(this, "Обрабатываются все " + scan.Folders.Count + " папок с медиа внутри:\n" + scan.Root + "\n\nПосле проверки результата будут удалены исходные фото и видео, включая дубликаты с проверенной готовой копией.\n\n" + (deleteJson ? "JSON обработанных пар также удалятся. Общий JSON удалится, только когда больше не нужен оставшимся исходникам." : "Исходные JSON останутся на месте.") + "\n\nФайлы без пары и файлы с ошибками сохранятся.\n\nПродолжить перемещение в:\n" + dest + "?", "Подтверждение перемещения всех подпапок", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
             busy = true; cancellation = new CancellationTokenSource(); EnableControls(); bar.Maximum = Math.Max(scan.Items.Count, 1); bar.Value = 0; state.Text = "Обработка…";
             try
             {
@@ -499,7 +541,7 @@ namespace TakeoutDateRepair
                     int done = s.Done, total = s.Total, ok = s.Success, failed = s.Failed, dup = s.Duplicates, warn = s.Warnings;
                     Ui(() => { bar.Value = Math.Min(done, bar.Maximum); counts.Text = string.Format("Выполнено: {0:N0} / {1:N0} | Успешно: {2:N0} | Дубликаты: {3:N0} | Ошибки: {4:N0} | Замечания: {5:N0}", done, total, ok, dup, failed, warn); state.Text = text.Length > 130 ? text.Substring(0, 127) + "…" : text; if (!text.StartsWith("Обработка:")) Message(text, error); });
                 }, deleteJson));
-                reportPath = result.Report; state.Text = cancellation.IsCancellationRequested ? "Остановлено. Необработанные исходники сохранены." : "Готово. Полный результат — в CSV-отчёте.";
+                reportPath = result.Report; state.Text = cancellation.IsCancellationRequested ? "Остановлено. Необработанные исходники сохранены." : "Готово. Общая очередь из " + scan.Folders.Count + " папок обработана. Подробности — в CSV-отчёте.";
                 Message("Отчёт: " + reportPath, false);
                 if (moving) scan = null;
             }
@@ -546,7 +588,7 @@ namespace TakeoutDateRepair
                 {
                     var scan = Engine.Analyze(args[1], false, CancellationToken.None, s => { });
                     string report = Engine.SaveScan(scan, args[2]);
-                    File.WriteAllText(System.IO.Path.Combine(args[2], "scan-summary.json"), Engine.Serializer().Serialize(new { media = scan.Items.Count, ready = scan.Items.Count(x => x.Problem == null), problems = scan.Items.Count(x => x.Problem != null), json = scan.JsonCount, orphan = scan.OrphanCount, issues = scan.Issues.Count, report = report }), Encoding.UTF8); return;
+                    File.WriteAllText(System.IO.Path.Combine(args[2], "scan-summary.json"), Engine.Serializer().Serialize(new { media = scan.Items.Count, ready = scan.Items.Count(x => x.Problem == null), problems = scan.Items.Count(x => x.Problem != null), json = scan.JsonCount, orphan = scan.OrphanCount, issues = scan.Issues.Count, directories = scan.DirectoryCount, mediaFolders = scan.Folders.Count, folders = scan.Folders, report = report }), Encoding.UTF8); return;
                 }
                 Application.Run(new MainForm(ExtractTool()));
             }

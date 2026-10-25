@@ -1,0 +1,39 @@
+# Only application source and synthetic tests belong in this repository.
+/artifacts/
+/.cache/
+/work/
+/test-results/
+/bin/
+/obj/
+*.exe
+*.pdb
+*.user
+*.suo
+
+# Photo libraries, metadata, reports and journals must stay local.
+*.jpg
+*.jpeg
+*.heic
+*.heif
+*.tif
+*.tiff
+*.webp
+*.gif
+*.bmp
+*.avif
+*.dng
+*.mp4
+*.mov
+*.m4v
+*.mkv
+*.avi
+*.webm
+*.json
+*.jsonl
+*.csv
+*.log
+_TakeoutDateRepair/
+
+# Documentation illustrations are deliberately allowed.
+*.png
+!docs/images/*.png

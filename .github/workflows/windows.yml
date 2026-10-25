@@ -1,0 +1,27 @@
+name: Windows build and tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build portable application
+        shell: powershell
+        run: .\scripts\build.ps1
+      - name: Test with synthetic files only
+        shell: powershell
+        run: .\scripts\test.ps1
+      - name: Save executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: TakeoutDateRepair-windows-x64
+          path: artifacts/TakeoutDateRepair.exe

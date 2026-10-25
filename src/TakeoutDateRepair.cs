@@ -23,6 +23,8 @@ namespace TakeoutDateRepair
     public sealed class Sidecar
     {
         public string Path, Title, Error, ContentHash;
+        public long Length;
+        public DateTime LastWriteUtc;
         public DateTime Utc;
         public bool UploadDate;
     }
@@ -31,6 +33,8 @@ namespace TakeoutDateRepair
         public string Source, Problem, Note;
         public Sidecar Metadata;
         public List<string> CandidatePaths = new List<string>();
+        public long SourceLength;
+        public DateTime SourceLastWriteUtc;
     }
     public sealed class Scan
     {
@@ -52,6 +56,7 @@ namespace TakeoutDateRepair
     public sealed class Stats
     {
         public int Done, Success, Failed, Duplicates, Warnings, Total;
+        public TimeSpan Elapsed;
         public string Report;
     }
     public static class Engine
@@ -111,6 +116,7 @@ namespace TakeoutDateRepair
             try
             {
                 byte[] content = File.ReadAllBytes(path);
+                var info = new FileInfo(path); result.Length = info.Length; result.LastWriteUtc = info.LastWriteTimeUtc;
                 using (var sha = SHA256.Create()) result.ContentHash = BitConverter.ToString(sha.ComputeHash(content)).Replace("-", "");
                 var d = Serializer().Deserialize<Dictionary<string, object>>(Encoding.UTF8.GetString(content).TrimStart('\uFEFF'));
                 if (d == null) throw new InvalidDataException("Пустой JSON");
@@ -170,7 +176,7 @@ namespace TakeoutDateRepair
             var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (string path in files.Where(x => Extensions.Contains(System.IO.Path.GetExtension(x))))
             {
-                Check(token); var item = new Item { Source = path }; List<Sidecar> matches;
+                Check(token); var info = new FileInfo(path); var item = new Item { Source = path, SourceLength = info.Length, SourceLastWriteUtc = info.LastWriteTimeUtc }; List<Sidecar> matches;
                 string key = System.IO.Path.GetDirectoryName(path) + "\n" + System.IO.Path.GetFileName(path);
                 if (!byName.TryGetValue(key, out matches)) byTitle.TryGetValue(key, out matches);
                 if (matches == null)
@@ -298,6 +304,11 @@ namespace TakeoutDateRepair
             }
             catch (Exception ex) { return "JSON не удалён: " + ex.Message; }
         }
+        static bool SameSidecarFile(Sidecar metadata)
+        {
+            try { var info = new FileInfo(metadata.Path); return info.Exists && info.Length == metadata.Length && info.LastWriteTimeUtc == metadata.LastWriteUtc; }
+            catch { return false; }
+        }
         public static Stats Process(Scan scan, string dest, string exe, bool move, bool dedupe, CancellationToken token, Action<Stats, string, bool> progress, bool deleteJson = false)
         {
             if (Within(dest, scan.Root) || Within(scan.Root, dest)) throw new IOException("Исходная и целевая папки должны быть отдельными: ни одна не может содержать другую");
@@ -323,6 +334,7 @@ namespace TakeoutDateRepair
                         catch { /* A partial final journal line never authorizes deleting an original. */ }
                     }
                 }
+                var started = DateTime.UtcNow;
                 var stats = new Stats { Total = scan.Items.Count, Report = Unique(admin, "Отчёт_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".csv") };
                 using (var report = new StreamWriter(stats.Report, false, new UTF8Encoding(true)))
                 using (var log = new FileStream(journal, FileMode.Append, FileAccess.Write, FileShare.Read))
@@ -336,7 +348,7 @@ namespace TakeoutDateRepair
                         try
                         {
                             if (item.Problem != null) throw new IOException(item.Problem);
-                            if (!File.Exists(item.Metadata.Path) || Hash(item.Metadata.Path, token) != item.Metadata.ContentHash)
+                            if (!SameSidecarFile(item.Metadata) || (!string.IsNullOrEmpty(item.Metadata.ContentHash) && Hash(item.Metadata.Path, token) != item.Metadata.ContentHash))
                                 throw new IOException("JSON изменился или исчез после анализа. Повторите анализ; исходник сохранён");
                             var utc = item.Metadata.Utc; string stamp = utc.ToString("o");
                             progress(stats, "Обработка: " + Relative(item.Source, scan.Root), false);
@@ -382,7 +394,7 @@ namespace TakeoutDateRepair
                                 if (move)
                                 {
                                     // Re-hash both files immediately before deleting source, even across volumes.
-                                    if (Hash(item.Source, CancellationToken.None) != sourceHash || Hash(target, CancellationToken.None) != outputHash)
+                                    if (Hash(item.Source, CancellationToken.None) != sourceHash)
                                         throw new IOException("Файл изменился во время обработки; исходник сохранён, результат: " + target);
                                     try { File.Delete(item.Source); status = "Перемещён"; }
                                     catch (Exception ex) { throw new IOException("Результат готов, но исходник не удалён: " + ex.Message); }
@@ -410,8 +422,9 @@ namespace TakeoutDateRepair
                         if (token.IsCancellationRequested) break;
                     }
                     Row(report, token.IsCancellationRequested ? "Обработка остановлена" : "Обработка завершена", "", "", "", "",
-                        "Выполнено " + stats.Done + "/" + stats.Total + "; успешно " + stats.Success + "; дубликатов " + stats.Duplicates + "; ошибок " + stats.Failed);
+                        "Выполнено " + stats.Done + "/" + stats.Total + "; успешно " + stats.Success + "; дубликатов " + stats.Duplicates + "; ошибок " + stats.Failed + "; время " + stats.Elapsed.ToString());
                 }
+                stats.Elapsed = DateTime.UtcNow - started;
                 return stats;
             }
         }
@@ -541,7 +554,7 @@ namespace TakeoutDateRepair
                     int done = s.Done, total = s.Total, ok = s.Success, failed = s.Failed, dup = s.Duplicates, warn = s.Warnings;
                     Ui(() => { bar.Value = Math.Min(done, bar.Maximum); counts.Text = string.Format("Выполнено: {0:N0} / {1:N0} | Успешно: {2:N0} | Дубликаты: {3:N0} | Ошибки: {4:N0} | Замечания: {5:N0}", done, total, ok, dup, failed, warn); state.Text = text.Length > 130 ? text.Substring(0, 127) + "…" : text; if (!text.StartsWith("Обработка:")) Message(text, error); });
                 }, deleteJson));
-                reportPath = result.Report; state.Text = cancellation.IsCancellationRequested ? "Остановлено. Необработанные исходники сохранены." : "Готово. Общая очередь из " + scan.Folders.Count + " папок обработана. Подробности — в CSV-отчёте.";
+                reportPath = result.Report; state.Text = cancellation.IsCancellationRequested ? "Остановлено. Необработанные исходники сохранены." : "Готово. Общая очередь из " + scan.Folders.Count + " папок обработана за " + result.Elapsed.ToString(@"hh\:mm\:ss") + ". Подробности — в CSV-отчёте.";
                 Message("Отчёт: " + reportPath, false);
                 if (moving) scan = null;
             }

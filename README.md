@@ -1,4 +1,4 @@
-> **Проверка безопасности бинарной сборки.** Microsoft Defender обнаруживает в `v1.2.0` и `v1.2.1` угрозу `Trojan:Win32/Wacatac.B!ml`. Обе сборки недоступны в публичных релизах. Ложное срабатывание пока не подтверждено. Не отключайте защиту и не добавляйте EXE в исключения. Старые релизы не считаются проверенной заменой. Статус: [SECURITY.md](SECURITY.md).
+> **Известные срабатывания антивирусов.** Релизы доступны для скачивания. Microsoft Defender и некоторые другие движки помечают сборки как подозрительные; ложное срабатывание официально не подтверждено. Результаты проверки: [SECURITY.md](SECURITY.md).
 
 <p align="center">
   <img src="docs/images/overview.svg" alt="TakeoutDateRepair — восстановление дат фото и видео из Google Takeout" width="100%">
@@ -35,7 +35,9 @@ Google Takeout сохраняет фотографии и видео вмест�
 
 ## Скачать и запустить
 
-**Распространение текущей бинарной сборки приостановлено.** Предыдущие релизы могут оставаться в истории GitHub; они не рекомендованы в качестве обхода обнаружения. Перед скачиванием и запуском проверьте статус в [SECURITY.md](SECURITY.md).
+**[Открыть последний релиз →](https://github.com/yargl5/TakeoutDateRepair/releases/latest)**
+
+[Все версии](https://github.com/yargl5/TakeoutDateRepair/releases) · [Прямое скачивание EXE v1.2.1](https://github.com/yargl5/TakeoutDateRepair/releases/download/v1.2.1/TakeoutDateRepair.exe) · [Статус проверки безопасности](SECURITY.md)
 
 Скачайте `TakeoutDateRepair.exe` или ZIP с приложением и лицензиями. Установка Python, .NET SDK и отдельного ExifTool не нужна.
 

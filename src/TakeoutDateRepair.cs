@@ -14,8 +14,8 @@ using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
-[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.2.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.2.0.0")]
 [assembly: System.Reflection.AssemblyProduct("TakeoutDateRepair")]
 
 namespace TakeoutDateRepair
@@ -23,8 +23,6 @@ namespace TakeoutDateRepair
     public sealed class Sidecar
     {
         public string Path, Title, Error, ContentHash;
-        public long Length;
-        public DateTime LastWriteUtc;
         public DateTime Utc;
         public bool UploadDate;
     }
@@ -33,8 +31,6 @@ namespace TakeoutDateRepair
         public string Source, Problem, Note;
         public Sidecar Metadata;
         public List<string> CandidatePaths = new List<string>();
-        public long SourceLength;
-        public DateTime SourceLastWriteUtc;
     }
     public sealed class Scan
     {
@@ -57,6 +53,7 @@ namespace TakeoutDateRepair
     {
         public int Done, Success, Failed, Duplicates, Warnings, Total;
         public TimeSpan Elapsed;
+        public int ToolProcessStarts;
         public string Report;
     }
     public static class Engine
@@ -116,7 +113,6 @@ namespace TakeoutDateRepair
             try
             {
                 byte[] content = File.ReadAllBytes(path);
-                var info = new FileInfo(path); result.Length = info.Length; result.LastWriteUtc = info.LastWriteTimeUtc;
                 using (var sha = SHA256.Create()) result.ContentHash = BitConverter.ToString(sha.ComputeHash(content)).Replace("-", "");
                 var d = Serializer().Deserialize<Dictionary<string, object>>(Encoding.UTF8.GetString(content).TrimStart('\uFEFF'));
                 if (d == null) throw new InvalidDataException("Пустой JSON");
@@ -176,7 +172,7 @@ namespace TakeoutDateRepair
             var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (string path in files.Where(x => Extensions.Contains(System.IO.Path.GetExtension(x))))
             {
-                Check(token); var info = new FileInfo(path); var item = new Item { Source = path, SourceLength = info.Length, SourceLastWriteUtc = info.LastWriteTimeUtc }; List<Sidecar> matches;
+                Check(token); var item = new Item { Source = path }; List<Sidecar> matches;
                 string key = System.IO.Path.GetDirectoryName(path) + "\n" + System.IO.Path.GetFileName(path);
                 if (!byName.TryGetValue(key, out matches)) byTitle.TryGetValue(key, out matches);
                 if (matches == null)
@@ -217,21 +213,35 @@ namespace TakeoutDateRepair
             using (var input = File.OpenRead(source)) using (var output = new FileStream(dest, FileMode.CreateNew, FileAccess.Write, FileShare.None))
             { byte[] buf = new byte[1024 * 1024]; int n; while ((n = input.Read(buf, 0, buf.Length)) > 0) { Check(token); output.Write(buf, 0, n); } output.Flush(true); }
         }
-        static string Arg(string s) { return "\"" + s.Replace("\"", "\\\"") + "\""; }
+        [ThreadStatic] static ToolWorker activeTool;
         public static string Tool(string exe, IEnumerable<string> args)
+        {
+            if (activeTool != null && string.Equals(exe, activeTool.Exe, StringComparison.OrdinalIgnoreCase)) return activeTool.Execute(args);
+            return OneShotTool(exe, args);
+        }
+        static ProcessStartInfo ToolStartInfo(string exe, bool persistent)
+        {
+            var info = new ProcessStartInfo(exe, persistent ? "-stay_open True -@ -" : "-charset filename=UTF8 -@ -") {
+                UseShellExecute = false, CreateNoWindow = true, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
+                StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8 };
+            info.EnvironmentVariables["LC_ALL"] = "C"; info.EnvironmentVariables["LC_CTYPE"] = "C"; info.EnvironmentVariables["LANG"] = "C";
+            return info;
+        }
+        static void SendArguments(Process process, IEnumerable<string> args)
+        {
+            string[] lines = args.ToArray();
+            if (lines.Any(x => x == null || x.IndexOfAny(new[] { '\r', '\n', '\0' }) >= 0)) throw new IOException("Недопустимый аргумент ExifTool");
+            byte[] bytes = new UTF8Encoding(false).GetBytes(string.Join("\n", lines) + "\n");
+            process.StandardInput.BaseStream.Write(bytes, 0, bytes.Length); process.StandardInput.BaseStream.Flush();
+        }
+        static string OneShotTool(string exe, IEnumerable<string> args)
         {
             using (var p = new Process())
             {
                 // Windows Perl argv uses the system code page. UTF-8 stdin preserves Cyrillic paths.
-                p.StartInfo = new ProcessStartInfo(exe, "-charset filename=UTF8 -@ -") {
-                    UseShellExecute = false, CreateNoWindow = true, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
-                    StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8 };
-                p.StartInfo.EnvironmentVariables["LC_ALL"] = "C";
-                p.StartInfo.EnvironmentVariables["LC_CTYPE"] = "C";
-                p.StartInfo.EnvironmentVariables["LANG"] = "C";
+                p.StartInfo = ToolStartInfo(exe, false);
                 p.Start(); var stdout = p.StandardOutput.ReadToEndAsync(); var stderr = p.StandardError.ReadToEndAsync();
-                byte[] argumentBytes = new UTF8Encoding(false).GetBytes(string.Join("\n", args) + "\n");
-                p.StandardInput.BaseStream.Write(argumentBytes, 0, argumentBytes.Length); p.StandardInput.Close();
+                SendArguments(p, args); p.StandardInput.Close();
                 // A file is a transaction: Stop waits for this metadata operation, never kills a writer mid-file.
                 if (!p.WaitForExit(300000)) { try { p.Kill(); } catch { } throw new IOException("ExifTool не ответил за 5 минут; исходник сохранён"); }
                 Task.WaitAll(stdout, stderr);
@@ -239,6 +249,82 @@ namespace TakeoutDateRepair
                 if (p.ExitCode != 0) throw new IOException("ExifTool: " + result.Trim());
                 return args.Contains("-j") ? stdout.Result.Trim() : result.Trim();
             }
+        }
+        sealed class ToolWorker : IDisposable
+        {
+            public readonly string Exe;
+            public int Starts;
+            readonly bool persistent;
+            readonly ToolWorker previous;
+            Process process;
+            int sequence;
+            public ToolWorker(string exe, bool reuse)
+            { Exe = exe; persistent = reuse; previous = activeTool; activeTool = this; }
+            sealed class ErrorFrame { public string Text; public int Status; }
+            static string ReadOutput(StreamReader reader, string marker)
+            {
+                var result = new StringBuilder(); string line;
+                while ((line = reader.ReadLine()) != null)
+                { if (line == marker) return result.ToString().Trim(); result.AppendLine(line); }
+                throw new IOException("ExifTool завершился до ответа; исходник сохранён");
+            }
+            static ErrorFrame ReadErrors(StreamReader reader, string marker)
+            {
+                var result = new StringBuilder(); string line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    if (line.StartsWith(marker, StringComparison.Ordinal))
+                    {
+                        int status;
+                        if (!int.TryParse(line.Substring(marker.Length), NumberStyles.Integer, CultureInfo.InvariantCulture, out status)) throw new IOException("Некорректный статус ExifTool");
+                        return new ErrorFrame { Text = result.ToString().Trim(), Status = status };
+                    }
+                    result.AppendLine(line);
+                }
+                throw new IOException("ExifTool завершился до статуса; исходник сохранён");
+            }
+            public string Execute(IEnumerable<string> arguments)
+            {
+                string[] args = arguments.ToArray();
+                if (!persistent) { Starts++; return OneShotTool(Exe, args); }
+                string output; ErrorFrame errors;
+                try
+                {
+                    if (process == null)
+                    {
+                        process = new Process { StartInfo = ToolStartInfo(Exe, true) }; process.Start(); Starts++;
+                    }
+                    int id = ++sequence;
+                    string errorMarker = "__TakeoutStatus_" + Guid.NewGuid().ToString("N") + "_";
+                    var outputReader = process.StandardOutput; var errorReader = process.StandardError;
+                    var stdout = Task.Run(() => ReadOutput(outputReader, "{ready" + id + "}"));
+                    var stderr = Task.Run(() => ReadErrors(errorReader, errorMarker));
+                    SendArguments(process, args.Concat(new[] { "-echo4", errorMarker + "${status}", "-execute" + id.ToString(CultureInfo.InvariantCulture) }));
+                    if (!Task.WaitAll(new Task[] { stdout, stderr }, 300000)) throw new IOException("ExifTool не ответил за 5 минут; исходник сохранён");
+                    output = stdout.Result; errors = stderr.Result;
+                }
+                catch (Exception ex)
+                {
+                    Stop(false);
+                    throw new IOException("Связь с ExifTool прервана; исходник сохранён. " + ex.GetBaseException().Message, ex);
+                }
+                // Both streams have been drained. A normal per-file error does not corrupt the next response.
+                if (errors.Status != 0) throw new IOException("ExifTool: " + output + "\n" + errors.Text);
+                return args.Contains("-j") ? output : (output + "\n" + errors.Text).Trim();
+            }
+            void Stop(bool graceful)
+            {
+                if (process == null) return;
+                try
+                {
+                    if (graceful && !process.HasExited) { SendArguments(process, new[] { "-stay_open", "False" }); process.StandardInput.Close(); }
+                    if (!process.HasExited && (!graceful || !process.WaitForExit(5000))) process.Kill();
+                    if (!process.HasExited) process.WaitForExit(5000);
+                }
+                catch { try { if (!process.HasExited) process.Kill(); } catch { } }
+                finally { process.Dispose(); process = null; }
+            }
+            public void Dispose() { try { Stop(true); } finally { activeTool = previous; } }
         }
         static string Stamp(DateTime utc) { return utc.ToString("yyyy:MM:dd HH:mm:ss", CultureInfo.InvariantCulture); }
         public static string WriteMetadata(string exe, string path, DateTime utc)
@@ -291,10 +377,10 @@ namespace TakeoutDateRepair
             }
             return file;
         }
-        static string CleanSidecar(Scan scan, Item item)
+        static string CleanSidecar(Item item, ILookup<string, Item> users)
         {
             string json = item.Metadata.Path;
-            if (scan.Items.Any(x => x.CandidatePaths.Contains(json, StringComparer.OrdinalIgnoreCase) && File.Exists(x.Source)))
+            if (users[json].Any(x => File.Exists(x.Source)))
                 return "JSON сохранён: ещё нужен необработанным исходным файлам";
             if (!File.Exists(json)) return "";
             try
@@ -304,18 +390,14 @@ namespace TakeoutDateRepair
             }
             catch (Exception ex) { return "JSON не удалён: " + ex.Message; }
         }
-        static bool SameSidecarFile(Sidecar metadata)
-        {
-            try { var info = new FileInfo(metadata.Path); return info.Exists && info.Length == metadata.Length && info.LastWriteTimeUtc == metadata.LastWriteUtc; }
-            catch { return false; }
-        }
-        public static Stats Process(Scan scan, string dest, string exe, bool move, bool dedupe, CancellationToken token, Action<Stats, string, bool> progress, bool deleteJson = false)
+        public static Stats Process(Scan scan, string dest, string exe, bool move, bool dedupe, CancellationToken token, Action<Stats, string, bool> progress, bool deleteJson = false, bool reuseTool = true)
         {
             if (Within(dest, scan.Root) || Within(scan.Root, dest)) throw new IOException("Исходная и целевая папки должны быть отдельными: ни одна не может содержать другую");
             Directory.CreateDirectory(dest);
             string admin = System.IO.Path.Combine(dest, "_TakeoutDateRepair"); Directory.CreateDirectory(admin);
             // Prevent simultaneous writers racing for names or corrupting the journal.
             using (var sessionLock = new FileStream(System.IO.Path.Combine(admin, "session.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
+            using (var toolWorker = new ToolWorker(exe, reuseTool))
             {
                 string journal = System.IO.Path.Combine(admin, "history.jsonl");
                 var history = new Dictionary<string, List<History>>(StringComparer.Ordinal);
@@ -334,7 +416,8 @@ namespace TakeoutDateRepair
                         catch { /* A partial final journal line never authorizes deleting an original. */ }
                     }
                 }
-                var started = DateTime.UtcNow;
+                var stopwatch = Stopwatch.StartNew();
+                var users = scan.Items.SelectMany(item => item.CandidatePaths.Select(path => new { path, item })).ToLookup(x => x.path, x => x.item, StringComparer.OrdinalIgnoreCase);
                 var stats = new Stats { Total = scan.Items.Count, Report = Unique(admin, "Отчёт_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".csv") };
                 using (var report = new StreamWriter(stats.Report, false, new UTF8Encoding(true)))
                 using (var log = new FileStream(journal, FileMode.Append, FileAccess.Write, FileShare.Read))
@@ -348,7 +431,7 @@ namespace TakeoutDateRepair
                         try
                         {
                             if (item.Problem != null) throw new IOException(item.Problem);
-                            if (!SameSidecarFile(item.Metadata) || (!string.IsNullOrEmpty(item.Metadata.ContentHash) && Hash(item.Metadata.Path, token) != item.Metadata.ContentHash))
+                            if (!File.Exists(item.Metadata.Path) || Hash(item.Metadata.Path, token) != item.Metadata.ContentHash)
                                 throw new IOException("JSON изменился или исчез после анализа. Повторите анализ; исходник сохранён");
                             var utc = item.Metadata.Utc; string stamp = utc.ToString("o");
                             progress(stats, "Обработка: " + Relative(item.Source, scan.Root), false);
@@ -394,7 +477,7 @@ namespace TakeoutDateRepair
                                 if (move)
                                 {
                                     // Re-hash both files immediately before deleting source, even across volumes.
-                                    if (Hash(item.Source, CancellationToken.None) != sourceHash)
+                                    if (Hash(item.Source, CancellationToken.None) != sourceHash || Hash(target, CancellationToken.None) != outputHash)
                                         throw new IOException("Файл изменился во время обработки; исходник сохранён, результат: " + target);
                                     try { File.Delete(item.Source); status = "Перемещён"; }
                                     catch (Exception ex) { throw new IOException("Результат готов, но исходник не удалён: " + ex.Message); }
@@ -403,7 +486,7 @@ namespace TakeoutDateRepair
                             }
                             if (move && deleteJson && !File.Exists(item.Source))
                             {
-                                string cleanupNote = CleanSidecar(scan, item);
+                                string cleanupNote = CleanSidecar(item, users);
                                 if (cleanupNote.Length > 0) note += (note.Length > 0 ? "; " : "") + cleanupNote;
                                 if (cleanupNote.IndexOf("не удалён", StringComparison.OrdinalIgnoreCase) >= 0 || cleanupNote.IndexOf("изменился", StringComparison.OrdinalIgnoreCase) >= 0) { stats.Warnings++; warning = true; }
                             }
@@ -421,10 +504,10 @@ namespace TakeoutDateRepair
                         progress(stats, status + ": " + Relative(item.Source, scan.Root) + (note.Length > 0 ? " — " + note : ""), bad || warning);
                         if (token.IsCancellationRequested) break;
                     }
+                    stats.Elapsed = stopwatch.Elapsed; stats.ToolProcessStarts = toolWorker.Starts;
                     Row(report, token.IsCancellationRequested ? "Обработка остановлена" : "Обработка завершена", "", "", "", "",
-                        "Выполнено " + stats.Done + "/" + stats.Total + "; успешно " + stats.Success + "; дубликатов " + stats.Duplicates + "; ошибок " + stats.Failed + "; время " + stats.Elapsed.ToString());
+                        "Выполнено " + stats.Done + "/" + stats.Total + "; успешно " + stats.Success + "; дубликатов " + stats.Duplicates + "; ошибок " + stats.Failed + "; время " + stats.Elapsed.ToString() + "; запусков ExifTool " + stats.ToolProcessStarts);
                 }
-                stats.Elapsed = DateTime.UtcNow - started;
                 return stats;
             }
         }
@@ -441,7 +524,7 @@ namespace TakeoutDateRepair
         Scan scan; string reportPath; bool busy; readonly string exe;
         public MainForm(string tool)
         {
-            exe = tool; Text = "TakeoutDateRepair 1.1.0 — все вложенные папки"; MinimumSize = new Size(860, 690); Size = new Size(1040, 820);
+            exe = tool; Text = "TakeoutDateRepair 1.2.0 — все вложенные папки"; MinimumSize = new Size(860, 690); Size = new Size(1040, 820);
             StartPosition = FormStartPosition.CenterScreen; Font = new Font("Segoe UI", 10); BackColor = Color.FromArgb(245, 247, 250);
             var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(22), ColumnCount = 3, RowCount = 13 };
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 132)); layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));

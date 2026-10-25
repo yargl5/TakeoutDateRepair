@@ -28,6 +28,8 @@ public static class PerformanceTests
     }
     public static void Main(string[] args)
     {
+        // Match UTF-8 consoles such as GitHub Actions; their Encoding.UTF8 preamble must never enter requests.
+        Console.InputEncoding = new System.Text.UTF8Encoding(true);
         string root = Path.GetFullPath(args[0]), input = Path.Combine(root, "input"); Directory.CreateDirectory(input);
         int count = args.Length > 2 ? int.Parse(args[2], CultureInfo.InvariantCulture) : 4;
         Assert(count >= 2 && count <= 100, "Benchmark size is bounded");
